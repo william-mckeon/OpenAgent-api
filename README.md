@@ -157,7 +157,7 @@ Users only ever interact with port 8000. Port 8001 is internal to the product la
 | Request correlation ID        | `openagent-api`  | `request_id` (UUID4) generated per /chat, threads through every event emitted to openagent-logger |
 | Event emission (fire-and-forget) | `openagent-api`| The /chat hot path must not block on the capture layer |
 | Event capture & storage       | `openagent-logger`| Sibling service; partitioned PostgreSQL, append-only   |
-| Conversation history          | `openagent-frontend` | In-session for now                             |
+| Conversation history          | `openagent-frontend` | Held in-session by the frontend                 |
 | Reasoning-format display      | `openagent-frontend` | UX policy decision, not an inference concern           |
 | Reasoning effort default      | `openagent-infra`| Server-side default lives upstream; openagent-api passes through only |
 | Reasoning effort injection    | `openagent-infra`| openagent-infra writes "Reasoning: <level>" into system msg |
@@ -240,7 +240,7 @@ openagent-api/
 │   │   └── api.py                  # The FastAPI app (single file)
 │   ├── client/
 │   │   ├── __init__.py             # Package marker
-│   │   ├── alpha_infra.py          # InfraClient — proxy
+│   │   ├── infra.py                # InfraClient — proxy to openagent-infra
 │   │   └── logger.py               # LoggerClient — fire-and-forget to openagent-logger
 │   └── prompt/
 │       └── bio.txt                 # OpenAgent system prompt (persona)
@@ -292,7 +292,7 @@ The keys MUST be different values. Reusing one defeats the entire compartmentali
 
 ### 3. Update `bio.txt` with your persona
 
-The persona lives in `src/prompt/bio.txt`. The repo ships with a baseline persona; rotate it to your real text before going to production. The file is read once at container startup and prepended as the first `system` message on every `/chat` call.
+The persona lives in `src/prompt/bio.txt`. The repo ships with a generic starter persona; replace it with your own before running anything you care about. The file is read once at container startup and prepended as the first `system` message on every `/chat` call.
 
 The file is baked into the Docker image at build time. **Rebuilding is required to pick up changes** — or mount a volume over `/app/src/prompt` in `docker-compose.yml` for live edits during development.
 
@@ -319,7 +319,11 @@ To verify the logger integration is working end-to-end, send a real `/chat` call
 
 ```bash
 # Send a /chat:
-curl -N -X POST -H "X-API-Key: <OPENAGENT_API_KEY>" -H "Content-Type: application/json"     -d '{"messages":[{"role":"user","content":"say hi"}],"reasoning_effort":"low"}'     http://localhost:8001/chat
+curl -N -X POST \
+  -H "X-API-Key: <OPENAGENT_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"say hi"}],"reasoning_effort":"low"}' \
+  http://localhost:8001/chat
 
 # Then check openagent-logger received the events:
 curl -fsS -H "X-API-Key: <LOGGER_API_KEY>" http://localhost:8003/stats
@@ -344,7 +348,7 @@ Every `/chat` and `/health` request must include `X-API-Key` matching `OPENAGENT
 
 ### Outbound auth (openagent-api → openagent-infra)
 
-The outbound boundary is owned by the `InfraClient` class in `src/client/alpha_infra.py`. The client's internal `httpx.AsyncClient` is constructed once at `start()` time with `headers={"X-API-Key": INFRA_API_KEY}`. Every outbound call inherits this header automatically.
+The outbound boundary is owned by the `InfraClient` class in `src/client/infra.py`. The client's internal `httpx.AsyncClient` is constructed once at `start()` time with `headers={"X-API-Key": INFRA_API_KEY}`. Every outbound call inherits this header automatically.
 
 ### Outbound auth (openagent-api → openagent-logger)
 
@@ -369,7 +373,7 @@ The frontend's `/health` polling loop talks to openagent-api. openagent-api forw
 
 ### Statelessness
 
-openagent-api is **stateless across requests**. It holds no conversation memory, no session_store, no per-user state. The frontend sends the full message list on every turn and the gateway forwards it without adding or remembering anything.
+openagent-api is **stateless across requests**. It holds no conversation memory, no session store, no per-user state. The frontend sends the full message list on every turn and the gateway forwards it without adding or remembering anything.
 
 ---
 
@@ -379,10 +383,10 @@ The system uses a **compartmentalization** architecture for service-to-service a
 
 ### Blast-radius analysis
 
-- **If `openagent-frontend` is compromised**: the attacker gets `OPENAGENT_API_KEY` only. They cannot reach openagent-infra, openagent-logger, or the Compute Provider directly.
+- **If `openagent-frontend` is compromised**: the attacker gets `OPENAGENT_API_KEY` only. They cannot reach openagent-infra, openagent-logger, or the compute provider directly.
 - **If `openagent-api` is compromised**: the attacker gets `OPENAGENT_API_KEY`, `INFRA_API_KEY`, `LOGGER_API_KEY`, and `LOGGER_HMAC_SECRET`. They still don't have `PROVIDER_API_KEY` — they cannot bypass openagent-infra to bill the compute provider directly.
 - **If `openagent-infra` is compromised**: the attacker gets `INFRA_API_KEY` and `PROVIDER_API_KEY`. The model layer is exposed, but openagent-api's inbound boundary stays safe, openagent-logger stays safe, and the frontend stays safe.
-- **If `openagent-logger` is compromised**: the attacker gets `LOGGER_API_KEY` and `LOGGER_HMAC_SECRET`. They can read whatever events have been captured, but they cannot reach openagent-api's inbound, openagent-infra, or the Compute Provider.
+- **If `openagent-logger` is compromised**: the attacker gets `LOGGER_API_KEY` and `LOGGER_HMAC_SECRET`. They can read whatever events have been captured, but they cannot reach openagent-api's inbound, openagent-infra, or the compute provider.
 
 ### Service-to-service vs user-to-service auth
 
@@ -406,7 +410,7 @@ Five events are emitted per successful `/chat` call:
 2. `upstream_call`
 3. `upstream_error` (if applicable)
 4. `stream_complete`
-5. `conversation_capture` (After a successful stream_complete only)
+5. `conversation_capture` (after a successful stream_complete only)
 
 ### Queue overflow: drop-oldest
 
@@ -501,7 +505,7 @@ For faster iteration than a Docker rebuild, run uvicorn directly on the host:
 # 1. Create a virtualenv
 python3.11 -m venv .venv
 source .venv/bin/activate   # Linux/macOS
-# .venv\Scripts ctivate    # Windows
+# .venv\Scripts\activate    # Windows
 
 # 2. Install dependencies
 pip install -r requirements.txt
@@ -545,7 +549,7 @@ When the queue fills (sustained openagent-logger outage), fresher data is more u
 
 ### Why no reasoning chain capture?
 
-`conversation_capture.output_text` contains only `delta.content` tokens (the visible answer), not `delta.reasoning` tokens (the chain-of-thought). Capturing the chain couples the training-data schema to a specific model's emission format.
+`conversation_capture.output_text` contains only `delta.content` tokens (the visible answer), not `delta.reasoning` tokens (the chain-of-thought). Capturing the chain couples the capture schema to a specific model's emission format.
 
 ### Why is `reasoning_effort` pass-through with no api default?
 
@@ -565,7 +569,7 @@ Statelessness. openagent-api is deliberately a pure gateway with no per-session 
 
 ### Why an in-memory queue instead of a durable outbox?
 
-Simplicity vs. durability trade-off. An **in-memory `asyncio.Queue`** is zero infrastructure: no new dependencies, no new services, no new failure modes.
+Simplicity vs. durability trade-off. An **in-memory `asyncio.Queue`** is zero infrastructure: no new dependencies, no new services, no new failure modes. The cost is that events queued in memory at the moment of a container restart are lost.
 
 ### Why is the `/health` endpoint authenticated?
 
@@ -585,6 +589,36 @@ A finite read timeout would kill long but legitimate generations. Connect timeou
 
 ---
 
+## Known Limitations
+
+These are present-tense limitations I'm aware of and accept for now.
+
+### No persistent conversation history
+
+History is held client-side by the frontend. Closing the browser tab loses everything; the gateway itself remembers nothing across requests.
+
+### No per-user authentication
+
+`OPENAGENT_API_KEY` is a shared secret between the frontend and the gateway, not a per-user credential. There is no "user A vs user B" at this layer. Not appropriate for exposure beyond a trusted operator without an auth layer in front.
+
+### No rate limiting or abuse protection
+
+The gateway trusts authenticated clients. Safe because the frontend is the only client. If exposed more widely, rate limiting would belong at a reverse proxy in front of the gateway.
+
+### Event capture is best-effort
+
+The capture pipeline is fire-and-forget with an in-memory queue, so events can be lost if openagent-logger is unreachable when an event is emitted, or if the queue fills during a sustained outage (drop-oldest). `/chat` is unaffected by this — losing capture events never degrades the user-facing response.
+
+### Context-window handling is upstream
+
+The gateway forwards whatever message list the frontend sends, without truncation. A long enough conversation will eventually hit the upstream model's context window and fail upstream.
+
+### Mid-stream upstream errors are in-band
+
+Once SSE headers go out (HTTP 200), the gateway can no longer change the status code. Mid-stream upstream failures are surfaced as `data: [ERROR ...]` followed by `data: [DONE]`; the HTTP status stays 200. The corresponding `upstream_error` ops_event captures the operational signal regardless.
+
+---
+
 ## Troubleshooting
 
 ### `🔐 401 Unauthorized` on every request
@@ -600,7 +634,7 @@ openagent-api cannot establish a TCP connection to `OPENAGENT_INFRA_URL`. Check 
 Every event POST is returning 401 from openagent-logger. `LOGGER_API_KEY` mismatch or `LOGGER_HMAC_SECRET` mismatch.
 
 ### `WARNING | LoggerClient queue full (max=1000); dropped oldest event`
-The in-memory queue has reached its capacity and is shedding old events to make room for new ones. openagent-logger is down/slow, or massive burst of traffic.
+The in-memory queue has reached its capacity and is shedding old events to make room for new ones. openagent-logger is down/slow, or there is a massive burst of traffic.
 
 ### Events aren't showing up in openagent-logger even though /chat works
 The fire-and-forget contract means /chat works regardless of whether events land. Check openagent-api's logs for `WARNING | LoggerClient POST failed`.
@@ -627,7 +661,9 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+```text
+http://www.apache.org/licenses/LICENSE-2.0
+```
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
