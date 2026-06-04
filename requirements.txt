@@ -1,0 +1,64 @@
+# ============================================================================
+# openagent-api - Python Dependencies
+# ============================================================================
+#
+# DEPENDENCY PHILOSOPHY:
+#   openagent-api is a thin SSE relay with a fire-and-forget logger emitter.
+#   It does no inference, no model loading, no agent reasoning, no database
+#   work, no UI rendering. The dependency footprint reflects that — four
+#   packages, no transitive bloat from CUDA, ML frameworks, ORMs, or
+#   template engines.
+#
+#   Specifically NOT here, and intentionally so:
+#     - groq, openai, anthropic, etc.    (no LLM client, all calls are HTTP)
+#     - torch, transformers, accelerate  (no inference, that's openagent-infra
+#                                         which is itself just a thin proxy
+#                                         in front of a BYOC provider and also
+#                                         doesn't carry these)
+#     - sqlalchemy, psycopg, redis       (stateless, no DB at this layer)
+#     - streamlit                        (no UI, that's openagent-frontend)
+#     - sseclient, aiohttp-sse           (httpx + iter_lines is sufficient)
+#     - cryptography, pynacl             (HMAC-SHA256 signing uses stdlib
+#                                         hmac + hashlib — no need for a
+#                                         third-party crypto package)
+#     - aiocache, aioredis, arq          (LoggerClient's queue is the stdlib
+#                                         asyncio.Queue — no third-party
+#                                         async-queue dependency)
+#
+# VERSION PINNING:
+#   Minimum versions only — top-level deps are pinned with `>=` so security
+#   patches flow through naturally. Hard pins (`==`) on transitive deps are
+#   not used here because the dependency graph is small and stable. When the
+#   system grows, switch to a lockfile (pip-tools or uv) for reproducible
+#   builds.
+# ============================================================================
+
+# FastAPI: the HTTP framework. Lifespan hooks, dependency injection,
+# StreamingResponse, Pydantic integration all required by api.py. 0.110+ is
+# needed for the modern lifespan context-manager API used in api.py
+# (replaces the deprecated @app.on_event("startup")). Pydantic ships as a
+# transitive dependency of FastAPI and is what validates the optional
+# reasoning_effort field's regex pattern.
+fastapi>=0.110.0
+
+# Uvicorn: ASGI server that runs FastAPI. The `[standard]` extra pulls in
+# uvloop and httptools for faster I/O — relevant because this service is
+# essentially a streaming proxy. 0.27+ for current asyncio support.
+uvicorn[standard]>=0.27.0
+
+# httpx: async HTTP client used by api.py to talk to openagent-infra (the SSE
+# streaming relay, via InfraClient) and by src/client/logger.py to POST
+# events to openagent-logger. Chosen over `requests` because requests is sync
+# and would block the FastAPI event loop. The async streaming API
+# (client.stream(), response.aiter_raw()) is what makes the SSE pump work
+# without buffering. 0.27+ for the current connection-pool defaults. The
+# LoggerClient's POSTs are short-lived, low-latency calls that reuse the same
+# httpx library but a separate AsyncClient instance (different base_url,
+# different headers, different timeouts).
+httpx>=0.27.0
+
+# python-dotenv: loads .env at startup so os.environ.get() in api.py's Config
+# sees the operator's values without requiring them to be exported in the
+# host shell. Same approach used by openagent-infra and openagent-frontend.
+# 1.0+ for the current API.
+python-dotenv>=1.0.0

@@ -1,0 +1,154 @@
+# ============================================================================
+# openagent-api - Docker build-context exclusions (.dockerignore)
+# ============================================================================
+#
+# Files matching these patterns are excluded from the Docker build context.
+# Two reasons this matters:
+#
+#   1. Security — .env contains secrets and must never end up in the image,
+#      regardless of whether the Dockerfile happens to COPY it. Belt and
+#      suspenders.
+#
+#   2. Speed — every file in the build context is sent to the Docker daemon,
+#      even files the Dockerfile doesn't reference. Excluding junk like
+#      .git, .venv, and __pycache__ keeps the context small and rebuilds
+#      fast.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# SECRETS — NEVER ALLOW IN THE IMAGE
+# ----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+
+
+# ----------------------------------------------------------------------------
+# VERSION CONTROL
+# ----------------------------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+.github/
+
+
+# ----------------------------------------------------------------------------
+# PYTHON
+# ----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+.installed.cfg
+MANIFEST
+
+
+# ----------------------------------------------------------------------------
+# VIRTUAL ENVIRONMENTS
+# ----------------------------------------------------------------------------
+# Local venvs should never make it into the image — pip installs fresh
+# inside the Dockerfile, and a venv from the host can have wrong-arch
+# binaries (e.g. macOS-built wheels on a Linux container).
+.venv/
+venv/
+ENV/
+env/
+.env-venv/
+
+
+# ----------------------------------------------------------------------------
+# TESTING / COVERAGE
+# ----------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.log
+.hypothesis/
+
+
+# ----------------------------------------------------------------------------
+# TYPE CHECKERS / LINTERS
+# ----------------------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+
+# ----------------------------------------------------------------------------
+# IDE / EDITOR
+# ----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+
+# ----------------------------------------------------------------------------
+# DOCKER ARTIFACTS
+# ----------------------------------------------------------------------------
+# This Dockerfile must not COPY itself or other Dockerfiles into the image.
+# Excluding the docker/ directory keeps the context smaller and prevents
+# recursive surprises.
+docker/
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore
+
+
+# ----------------------------------------------------------------------------
+# DOCUMENTATION (not needed in the runtime image)
+# ----------------------------------------------------------------------------
+README.md
+docs/
+*.md
+
+
+# ----------------------------------------------------------------------------
+# OS-SPECIFIC GARBAGE
+# ----------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+
+# ----------------------------------------------------------------------------
+# LOCAL TOOLING
+# ----------------------------------------------------------------------------
+.history/
+.local/
+node_modules/

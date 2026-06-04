@@ -1,0 +1,176 @@
+# ============================================================================
+# openagent-api - Git exclusions (.gitignore)
+# ============================================================================
+#
+# What's tracked in this repo:
+#   - src/                    (api.py, client/, bio.txt)
+#   - docker/                 (Dockerfile)
+#   - docker-compose.yml
+#   - requirements.txt
+#   - .env.example            (template, no secrets)
+#   - .dockerignore
+#   - .gitignore              (this file)
+#   - README.md, docs/        (when they exist)
+#
+# What's NOT tracked:
+#   - .env                    (real secrets)
+#   - any *.key / *.pem
+#   - venvs, caches, build artifacts
+#   - editor-local files
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# SECRETS — NEVER COMMIT
+# ----------------------------------------------------------------------------
+# The single most important block in this file. .env holds the inbound and
+# outbound API keys for openagent-api. If it ever gets committed, the keys
+# must be rotated immediately, the commit must be removed from history
+# (git filter-repo or BFG), and the new history force-pushed.
+.env
+.env.*
+!.env.example
+
+# Other secret material — keys, certs, anything that shouldn't leak.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+private/
+
+
+# ----------------------------------------------------------------------------
+# PYTHON
+# ----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+
+# ----------------------------------------------------------------------------
+# VIRTUAL ENVIRONMENTS
+# ----------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+
+# ----------------------------------------------------------------------------
+# TESTING / COVERAGE
+# ----------------------------------------------------------------------------
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+nosetests.xml
+
+
+# ----------------------------------------------------------------------------
+# TYPE CHECKERS / LINTERS
+# ----------------------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+
+# ----------------------------------------------------------------------------
+# LOGS
+# ----------------------------------------------------------------------------
+# openagent-api logs to stdout, not to files — but if a developer redirects
+# logs locally, don't commit them.
+*.log
+logs/
+
+
+# ----------------------------------------------------------------------------
+# IDE / EDITOR
+# ----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+.spyderproject
+.spyproject
+.ropeproject
+.history/
+
+
+# ----------------------------------------------------------------------------
+# OS
+# ----------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+
+# ----------------------------------------------------------------------------
+# DOCKER LOCAL OVERRIDES
+# ----------------------------------------------------------------------------
+# Operators sometimes use docker-compose.override.yml for local-only tweaks
+# (mounted volumes for live editing, exposing extra ports, etc). These are
+# personal and don't belong in the repo.
+docker-compose.override.yml
+docker-compose.local.yml
+
+
+# ----------------------------------------------------------------------------
+# JETBRAINS / PYCHARM
+# ----------------------------------------------------------------------------
+*.iml
+.idea_modules/
+
+
+# ----------------------------------------------------------------------------
+# MISC
+# ----------------------------------------------------------------------------
+*.pid
+*.seed
+*.tgz
+*.tar.gz
+node_modules/
