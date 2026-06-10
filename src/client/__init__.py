@@ -11,6 +11,8 @@
 #
 #     client/logger.py  — fire-and-forget client for openagent-logger
 #     client/infra.py   — streaming client for openagent-infra
+#     client/memory.py  — session-scoped RAG client for openagent-memory
+#                         (optional; used only when memory is configured)
 #
 # IMPORT PATH:
 #   PYTHONPATH inside the container is /app/src per Dockerfile, so modules
@@ -18,6 +20,7 @@
 #
 #     from client.logger import LoggerClient
 #     from client.infra import InfraClient
+#     from client.memory import MemoryClient
 #
 #   That matches the existing `from backend.api import app` style used in
 #   the Dockerfile CMD.

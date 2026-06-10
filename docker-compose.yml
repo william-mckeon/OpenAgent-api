@@ -12,31 +12,37 @@
 #     8001 = openagent-api      (this service)
 #     8002 = openagent-infra    (model layer, separate stack)
 #     8003 = openagent-logger   (capture layer, separate stack)
+#     8004 = openagent-memory   (RAG layer, separate stack — optional/opt-in)
 #
 # DEPLOYMENT TOPOLOGIES:
-#   openagent-frontend, openagent-api, openagent-infra, and openagent-logger
-#   each live in their own repos with their own compose files. openagent-api
-#   has two outbound boundaries: openagent-infra (hot path, /chat relay) and
-#   openagent-logger (fire-and-forget event emission). Three topologies are
-#   supported, selected by what OPENAGENT_INFRA_URL and LOGGER_URL are set to
-#   in .env:
+#   openagent-frontend, openagent-api, openagent-infra, openagent-logger, and
+#   openagent-memory each live in their own repos with their own compose
+#   files. openagent-api has up to three outbound boundaries: openagent-infra
+#   (hot path, /chat relay), openagent-logger (fire-and-forget event
+#   emission), and — when configured — openagent-memory (opt-in RAG
+#   retrieve/ingest). Three topologies are supported, selected by what
+#   OPENAGENT_INFRA_URL, LOGGER_URL, and (optionally) MEMORY_URL are set to in
+#   .env:
 #
 #     1. Everything on the host (no Docker for any service):
 #          OPENAGENT_INFRA_URL=http://localhost:8002
 #          LOGGER_URL=http://localhost:8003
+#          MEMORY_URL=http://localhost:8004            # optional
 #
-#     2. openagent-api in Docker, openagent-infra + openagent-logger on host:
+#     2. openagent-api in Docker, upstreams on host:
 #          OPENAGENT_INFRA_URL=http://host.docker.internal:8002
 #          LOGGER_URL=http://host.docker.internal:8003
+#          MEMORY_URL=http://host.docker.internal:8004 # optional
 #        (The extra_hosts directive below makes this work on Linux as well
 #        as Docker Desktop. This is the default — the dev workflow has the
 #        upstreams running on the host, reached via the host's port
 #        mapping.)
 #
-#     3. openagent-api, openagent-infra, and openagent-logger all in Docker
-#        on a shared external network:
+#     3. openagent-api, openagent-infra, openagent-logger (and optionally
+#        openagent-memory) all in Docker on a shared external network:
 #          OPENAGENT_INFRA_URL=http://openagent-infra:8002
 #          LOGGER_URL=http://openagent-logger:8003
+#          MEMORY_URL=http://openagent-memory:8004      # optional
 #        (Requires the operator to create the shared network and set the
 #        networks: directive accordingly. See "SHARED NETWORK" below. The
 #        network name is `openagent-network`, matching openagent-logger's
@@ -46,18 +52,19 @@
 #   that is the most common dev setup — openagent-infra running on the host
 #   as a thin FastAPI proxy in front of a BYOC provider, openagent-logger
 #   running in its own Docker stack on the host, and openagent-api in a
-#   container.
+#   container. openagent-memory, when enabled, follows the same pattern.
 #
 # SHARED NETWORK (topology 3):
-#   To put openagent-api, openagent-infra, and openagent-logger on the same
-#   Docker network, the operator must create the network once:
+#   To put openagent-api, openagent-infra, openagent-logger (and, when
+#   enabled, openagent-memory) on the same Docker network, the operator must
+#   create the network once:
 #     docker network create openagent-network
 #   Then uncomment the `networks:` block at the bottom of this file and the
-#   `networks:` line in the service definition. All three compose stacks
-#   (openagent-api, openagent-infra, openagent-logger) must reference the
-#   same external network for service-name resolution to work.
-#   openagent-logger's compose file already declares `openagent-network` as
-#   external, so no change is needed there.
+#   `networks:` line in the service definition. All participating compose
+#   stacks (openagent-api, openagent-infra, openagent-logger, and
+#   openagent-memory if used) must reference the same external network for
+#   service-name resolution to work. openagent-logger's compose file already
+#   declares `openagent-network` as external, so no change is needed there.
 #
 # WHY SINGLE SERVICE?
 #   openagent-api is one container. It does not own a database, a worker, or
@@ -65,14 +72,17 @@
 #   their own compose files and connect to openagent-api (or are connected to
 #   by it) over HTTP — they are not added here. openagent-logger remains in
 #   its own compose stack and openagent-api reaches it via LOGGER_URL.
+#   openagent-memory, when enabled, likewise lives in its own stack and is
+#   reached via MEMORY_URL — it owns its OWN database (pgvector); openagent-api
+#   stores nothing locally.
 #
 # REBUILD WHEN:
 #   - src/backend/api.py changes        → docker-compose up -d --build
 #   - src/client/*.py changes           → docker-compose up -d --build
 #                                         (the single COPY src/client/
 #                                         directive in the Dockerfile covers
-#                                         both client/infra.py and
-#                                         client/logger.py)
+#                                         client/infra.py, client/logger.py,
+#                                         and client/memory.py)
 #   - src/prompt/bio.txt changes        → docker-compose up -d --build
 #   - requirements.txt changes          → docker-compose up -d --build
 #   - docker/api/Dockerfile changes     → docker-compose up -d --build
@@ -97,8 +107,8 @@ services:
     # Build context is the repo root so the Dockerfile's COPY directives
     # (which reference src/prompt/, src/client/, src/backend/,
     # requirements.txt) resolve against the repo layout. The src/client/ COPY
-    # directive picks up both client modules (infra.py and logger.py) because
-    # it copies the entire directory — no per-module Dockerfile change.
+    # directive picks up all client modules (infra.py, logger.py, memory.py)
+    # because it copies the entire directory — no per-module Dockerfile change.
     build:
       context: .
       dockerfile: docker/api/Dockerfile
@@ -132,6 +142,18 @@ services:
     #                                     queue before drop-oldest kicks in,
     #                                     default 1000.
     #
+    # Optional openagent-memory variables (opt-in; memory is enabled only when
+    # both MEMORY_URL and MEMORY_API_KEY are set — otherwise full history is
+    # forwarded as before):
+    #   MEMORY_URL                      — base URL of openagent-memory
+    #   MEMORY_API_KEY                  — outbound auth secret to openagent-memory
+    #                                     (transport-key only; no HMAC today)
+    #   MEMORY_SESSION_ID               — scopes retrieve/ingest + sets the
+    #                                     session_id on emitted logger events
+    #   MEMORY_RECENT_N                 — recent turns kept verbatim, default 10
+    #   MEMORY_TOP_K                    — retrieve cap, default = memory's own (5)
+    #   MEMORY_RETRIEVE_TIMEOUT         — seconds, hot-path bound, default 5.0
+    #
     # The compose file does not declare these inline — they live in .env and
     # are passed via env_file: as with the other secrets.
     env_file:
@@ -155,11 +177,14 @@ services:
     # Makes host.docker.internal resolve to the host machine on Linux. Docker
     # Desktop (Mac/Windows) provides this automatically; Linux does not, so we
     # declare it explicitly for cross-platform parity. Required for topology 2
-    # (openagent-api in Docker, openagent-infra and openagent-logger on host)
-    # — the default topology. openagent-api uses this single entry to reach
-    # BOTH upstream services on the host via:
+    # (openagent-api in Docker, upstreams on host) — the default topology.
+    # openagent-api uses this single entry to reach ALL of its upstream
+    # services on the host via:
     #   OPENAGENT_INFRA_URL=http://host.docker.internal:8002
     #   LOGGER_URL=http://host.docker.internal:8003
+    #   MEMORY_URL=http://host.docker.internal:8004   (when memory is enabled)
+    # One host-gateway entry covers every upstream port; no per-service entry
+    # is needed.
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -182,17 +207,19 @@ services:
     # ------------------------------------------------------------------------
     # NETWORKS (topology 3 — uncomment to enable)
     # ------------------------------------------------------------------------
-    # When openagent-api, openagent-infra, and openagent-logger all run in
-    # Docker and need to reach each other by service name
+    # When openagent-api, openagent-infra, openagent-logger (and, when
+    # enabled, openagent-memory) all run in Docker and need to reach each
+    # other by service name
     # (OPENAGENT_INFRA_URL=http://openagent-infra:8002,
-    #  LOGGER_URL=http://openagent-logger:8003), uncomment both this block and
+    #  LOGGER_URL=http://openagent-logger:8003,
+    #  MEMORY_URL=http://openagent-memory:8004), uncomment both this block and
     # the top-level `networks:` block at the bottom of this file. The operator
     # must also create the network once on the host:
     #   docker network create openagent-network
-    # All sibling compose stacks (openagent-infra, openagent-logger) must
-    # reference the same external network. openagent-logger's compose file
-    # already declares `openagent-network` as external, so no change is needed
-    # there.
+    # All sibling compose stacks (openagent-infra, openagent-logger, and
+    # openagent-memory if used) must reference the same external network.
+    # openagent-logger's compose file already declares `openagent-network` as
+    # external, so no change is needed there.
     #
     # networks:
     #   - openagent-network
@@ -210,8 +237,10 @@ services:
     # to openagent-logger. The Docker logs capped here contain operator-facing
     # INFO/WARNING/ERROR lines (one per /chat, plus lifespan startup/shutdown
     # messages). Structured event capture (request_received / upstream_call /
-    # upstream_error / stream_complete / conversation_capture) lands in
-    # openagent-logger's Postgres tables, not in this Docker log stream.
+    # upstream_error / stream_complete / conversation_capture, plus
+    # memory_retrieve_degraded and memory_ingest_error when memory is enabled)
+    # lands in openagent-logger's Postgres tables, not in this Docker log
+    # stream.
     logging:
       driver: json-file
       options:
@@ -223,10 +252,11 @@ services:
 # ----------------------------------------------------------------------------
 # This declares `openagent-network` as an external network created outside
 # this compose stack. openagent-logger's compose file declares the same
-# external network. openagent-infra's compose file should declare the same
-# external network if you want all three services on the unified Docker
-# network. The operator runs `docker network create openagent-network` once
-# before bringing up any of the stacks.
+# external network. openagent-infra's compose file (and openagent-memory's, if
+# you run memory in Docker) should declare the same external network if you
+# want all the services on the unified Docker network. The operator runs
+# `docker network create openagent-network` once before bringing up any of
+# the stacks.
 #
 # See the SHARED NETWORK section in the header for the full bring-up steps.
 #
