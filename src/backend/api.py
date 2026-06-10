@@ -12,29 +12,46 @@
 #   openagent-infra directly and does not carry the persona — both
 #   responsibilities live here.
 #
-#   Four concerns live in this file and nowhere else:
+#   Five concerns live in this file and nowhere else (the fifth is OPTIONAL,
+#   active only when openagent-memory is configured):
 #     1. Auth boundary — validates OPENAGENT_API_KEY inbound, attaches
-#        INFRA_API_KEY outbound to openagent-infra and LOGGER_API_KEY
-#        outbound to openagent-logger. Three independent secrets at three
-#        independent boundaries. The frontend never sees INFRA_API_KEY
-#        or LOGGER_API_KEY. openagent-infra never sees OPENAGENT_API_KEY
-#        or LOGGER_API_KEY. openagent-logger never sees OPENAGENT_API_KEY
-#        or INFRA_API_KEY.
-#     2. Identity owner — loads bio.txt once at startup and prepends it
-#        as the first system message on every upstream /chat call.
+#        INFRA_API_KEY outbound to openagent-infra, LOGGER_API_KEY outbound
+#        to openagent-logger, and (when memory is enabled) MEMORY_API_KEY
+#        outbound to openagent-memory. Independent secrets at independent
+#        boundaries. The frontend never sees INFRA_API_KEY, LOGGER_API_KEY,
+#        or MEMORY_API_KEY. openagent-infra never sees OPENAGENT_API_KEY,
+#        LOGGER_API_KEY, or MEMORY_API_KEY. openagent-logger never sees
+#        OPENAGENT_API_KEY, INFRA_API_KEY, or MEMORY_API_KEY.
+#     2. Identity owner + prompt assembly — loads bio.txt once at startup
+#        and prepends it as the first system message on every upstream /chat
+#        call. When memory is enabled, openagent-api also OWNS the final
+#        query assembly: [bio] + [retrieved older turns] + [recent N turns
+#        verbatim] + [current user turn]. Memory only ranks; the gateway
+#        builds the prompt.
 #     3. SSE relay — orchestrates a streaming POST to openagent-infra via
 #        InfraClient (see src/client/infra.py), pipes the SSE
 #        byte-for-byte back to the frontend including the data: prefix and
 #        the [DONE] sentinel, and detects mid-stream client disconnects.
 #     4. Logger emission — emits operational events (request_received,
-#        upstream_call, upstream_error, stream_complete) and full
-#        conversation captures to openagent-logger via the fire-and-forget
-#        LoggerClient (src/client/logger.py). The /chat hot path never
-#        blocks on logger availability — emissions enqueue and a
+#        upstream_call, upstream_error, stream_complete, and — when memory
+#        is enabled — memory_retrieve_degraded and memory_ingest_error) and
+#        full conversation captures to openagent-logger via the
+#        fire-and-forget LoggerClient (src/client/logger.py). The /chat hot
+#        path never blocks on logger availability — emissions enqueue and a
 #        background asyncio task drains the queue. If openagent-logger is
 #        unreachable, events are queued and eventually dropped if the queue
 #        overflows (drop-oldest policy). See src/client/logger.py for the
 #        full integration contract.
+#     5. Memory retrieval + ingest (OPTIONAL) — when openagent-memory is
+#        configured, openagent-api calls MemoryClient.retrieve() on the hot
+#        path BEFORE assembling the prompt (awaited, bounded, fail-open) and
+#        fires MemoryClient.ingest_turn_pair_background() AFTER a clean
+#        stream (off the user's path, a tracked background task). Memory is
+#        OPT-IN (enabled by the presence of MEMORY_URL + MEMORY_API_KEY) and
+#        is NOT a refuse-to-boot dependency — when it is unconfigured or its
+#        session_id is unset, openagent-api forwards the full history exactly
+#        as it did before memory existed. See src/client/memory.py for the
+#        full contract.
 #
 #   reasoning_effort is an optional pass-through of the OpenAI-style field
 #   (low / medium / high). When the frontend sends it, openagent-api
@@ -88,6 +105,14 @@
 #     │         data: {"id":"chatcmpl-...","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n
 #     │         data: [DONE]\n\n
 #     │
+#     ├─→ openagent-memory (OPTIONAL — session-scoped RAG; only when configured)
+#     │   via MemoryClient (src/client/memory.py)
+#     │   HOT PATH  (bounded, fail-open):  POST /retrieve  (before assembly)
+#     │   OFF-PATH  (tracked task):        POST /ingest ×2 (after success)
+#     │   X-API-Key: MEMORY_API_KEY
+#     │   Retrieval degrades to "recent turns only" if memory/its embedder
+#     │   is unavailable; ingest failures are logged + emitted, never block.
+#     │
 #     └─→ openagent-logger (FIRE-AND-FORGET — never blocks /chat)
 #         via LoggerClient (src/client/logger.py)
 #         HTTP POST /events  {ops_event | conversation_capture}
@@ -95,12 +120,14 @@
 #         HMAC-SHA256 sig:  computed per-event with LOGGER_HMAC_SECRET
 #         Async drain:      in-process asyncio.Queue + background task
 #                           (see src/client/logger.py for full contract)
-#         Five emission points per /chat:
-#           request_received  ───→ ops_event (at ingress)
-#           upstream_call     ───→ ops_event (before openagent-infra POST)
-#           upstream_error    ───→ ops_event (on any upstream failure)
-#           stream_complete   ───→ ops_event (after SSE pump finishes)
-#           conversation_capture (after successful stream_complete only)
+#         Emission points per /chat:
+#           request_received        ───→ ops_event (at ingress)
+#           memory_retrieve_degraded ──→ ops_event (memory path, on degrade)
+#           upstream_call           ───→ ops_event (before openagent-infra POST)
+#           upstream_error          ───→ ops_event (on any upstream failure)
+#           stream_complete         ───→ ops_event (after SSE pump finishes)
+#           conversation_capture         (after successful stream_complete only)
+#           memory_ingest_error     ───→ ops_event (memory path, on ingest fail)
 #
 #   Each chunk's choices[0].delta carries either a reasoning token
 #   (chain-of-thought, in the model's reasoning format) or a content token
@@ -119,6 +146,7 @@
 #   8001 = openagent-api      (internal API the frontend talks to)
 #   8002 = openagent-infra    (FastAPI proxy; only openagent-api calls it)
 #   8003 = openagent-logger   (capture layer; only openagent-api emits to it)
+#   8004 = openagent-memory   (RAG layer; only openagent-api calls it)
 #   BYOC provider = remote inference, reached only by openagent-infra
 #
 # DOCKER SERVICE:
@@ -127,25 +155,27 @@
 #     Command:    uvicorn backend.api:app --host 0.0.0.0 --port 8001
 #     PYTHONPATH: /app/src  (set in Dockerfile)
 #     Volumes:    none (bio.txt is baked into the image at build time)
-#     Networks:   reachable by openagent-frontend; reaches openagent-infra
-#                 and openagent-logger.
+#     Networks:   reachable by openagent-frontend; reaches openagent-infra,
+#                 openagent-logger, and (when configured) openagent-memory.
 #
 # IMPORT PATH RULE:
 #   PYTHONPATH is /app/src inside the container. The package form for
 #   backend modules is `from backend.<module> import ...`. The package form
 #   for outbound clients is `from client.<service> import ...` — see
-#   src/client/__init__.py. The package holds two client classes:
-#   LoggerClient (src/client/logger.py) and InfraClient
-#   (src/client/infra.py). openagent-api is its own service in its own repo
-#   and imports nothing from any other service's repo. All inter-service
-#   communication is over HTTP.
+#   src/client/__init__.py. The package holds three client classes:
+#   LoggerClient (src/client/logger.py), InfraClient (src/client/infra.py),
+#   and MemoryClient (src/client/memory.py). openagent-api is its own
+#   service in its own repo and imports nothing from any other service's
+#   repo. All inter-service communication is over HTTP.
 #
 # RULES — WHAT THIS FILE MUST NEVER DO:
 #   ❌ Connect to a database, run a router, call an agent, load tools, hold
 #      conversation history, or do anything resembling routing, agent
 #      orchestration, or conversation-history behaviour. openagent-api is a
 #      stateless SSE gateway with a side-channel capture emitter, and
-#      nothing more.
+#      nothing more. (Memory storage lives in openagent-memory's OWN
+#      database, never here; openagent-api only ranks-via-retrieve and
+#      writes-via-ingest over HTTP.)
 #   ❌ Buffer the upstream stream into memory before forwarding. The whole
 #      point of streaming is that the user sees tokens as they arrive. A
 #      scale-to-zero provider cold-start can take minutes on first request,
@@ -167,19 +197,24 @@
 #      omits it from the upstream payload and openagent-infra applies its
 #      own default. Adding an openagent-api default would create two
 #      sources of truth for the same setting.
+#   ❌ Block /chat on a memory call. retrieve() is bounded + fail-open and is
+#      the only memory call on the hot path; ingest runs off the user's path
+#      as a detached background task. A memory outage degrades retrieval to
+#      "recent turns only" and never delays the user's first token or fails
+#      the request.
 #   ❌ Leak INFRA_API_KEY downstream — never log it, never echo it back to
 #      the frontend, never include it in error responses. It lives in this
 #      service's environment and goes upstream only. The key is owned by
 #      InfraClient (stored on the client at construction and pre-attached
 #      to the AsyncClient at start()); api.py reads it from config only to
 #      pass it to the InfraClient constructor.
-#   ❌ Leak LOGGER_API_KEY or LOGGER_HMAC_SECRET anywhere. They live in this
-#      service's environment and are passed once to the LoggerClient at
-#      startup; never logged, never echoed, never forwarded to
-#      openagent-infra or the frontend.
-#   ❌ Trust INFRA_API_KEY, OPENAGENT_API_KEY, and LOGGER_API_KEY to be the
-#      same value. They are independently generated and validated against
-#      three different boundaries.
+#   ❌ Leak LOGGER_API_KEY, LOGGER_HMAC_SECRET, or MEMORY_API_KEY anywhere.
+#      They live in this service's environment and are passed once to their
+#      respective clients at startup; never logged, never echoed, never
+#      forwarded to the wrong boundary or the frontend.
+#   ❌ Trust INFRA_API_KEY, OPENAGENT_API_KEY, LOGGER_API_KEY, and
+#      MEMORY_API_KEY to be the same value. They are independently generated
+#      and validated against different boundaries.
 #   ❌ Block /chat on a logger emission. The fire-and-forget contract is
 #      sacred — emit methods on LoggerClient are synchronous and do not
 #      perform I/O; they enqueue and return in microseconds. If you ever
@@ -189,10 +224,11 @@
 #      POST failure by design (per openagent-logger DATASHEET §7's
 #      accepted-loss framing). Retrying inside openagent-api would just pile
 #      up memory pressure.
-#   ❌ Emit conversation_capture for streams that did not complete
-#      successfully. Captures are for observability and audit; partial or
-#      errored streams aren't useful there. stream_complete with
-#      outcome=client_disconnect or outcome=failure is enough.
+#   ❌ Emit conversation_capture (or ingest to memory) for streams that did
+#      not complete successfully. Captures and ingests are for the completed
+#      turn; partial or errored streams aren't useful. stream_complete with
+#      outcome=client_disconnect or outcome=failure is enough — no capture,
+#      no ingest.
 #   ❌ Allow CORS origin "*". The frontend is the only legitimate client.
 #   ❌ Pass through frontend-supplied system messages. bio.txt is the
 #      authoritative OpenAgent persona. Any "system" role in the inbound
@@ -219,8 +255,10 @@
 #      httpx.AsyncClient is constructed with the header pre-attached at
 #      start() time.
 #   ✅ Attach X-API-Key: <LOGGER_API_KEY> to every outbound call to
-#      openagent-logger. The LoggerClient handles this internally — its
-#      httpx.AsyncClient is constructed with the header pre-attached.
+#      openagent-logger, and X-API-Key: <MEMORY_API_KEY> to every outbound
+#      call to openagent-memory. The LoggerClient and MemoryClient each
+#      handle this internally — their httpx.AsyncClient is constructed with
+#      the header pre-attached.
 #   ✅ Load bio.txt once at startup and prepend it as the first
 #      {"role": "system", "content": ...} message on every upstream /chat
 #      request.
@@ -248,11 +286,14 @@
 #      conversation_capture for that one request. It is also the value
 #      openagent-logger uses as the canonical-string prefix when verifying
 #      HMAC signatures.
-#   ✅ Emit session_id and user_id as null on every event. The reference
-#      stack does not track sessions or users; both are reserved, nullable
-#      correlation fields that openagent-logger accepts as null.
-#      openagent-api does not read a session header and holds no per-session
-#      state.
+#   ✅ Thread session_id through every emitted event. session_id comes from
+#      the MEMORY_SESSION_ID env var today (it is null when memory is not
+#      configured / no session_id is set; the frontend will mint and supply
+#      it once it manages conversations). When set, the same value scopes
+#      memory retrieve/ingest AND populates the logger's previously-null
+#      session_id field, so events from one conversation can be joined.
+#      user_id remains null on every event — the reference stack has no
+#      per-user identity.
 #   ✅ Emit a request_received ops_event after auth passes, before any
 #      other work. The event captures that a /chat call arrived; HTTP
 #      status of the response captures whether validation passed.
@@ -275,6 +316,10 @@
 #      visible-answer content (delta.content tokens concatenated). The
 #      reasoning chain is NOT captured — see src/client/logger.py header
 #      for the rationale.
+#   ✅ When memory is active, fire ingest_turn_pair_background() ONLY after a
+#      successful stream_complete, alongside the conversation_capture. It
+#      ingests the user turn then the assistant turn off the user's path; a
+#      client-disconnect or upstream-error turn ingests neither side.
 #   ✅ Accumulate delta.content tokens via SIDE-CHANNEL JSON parsing while
 #      still forwarding bytes byte-for-byte to the frontend. The yield to
 #      the frontend happens BEFORE the parse in every chunk iteration, so
@@ -304,30 +349,35 @@
 #
 # ENDPOINTS:
 #   POST /chat    — SSE relay (StreamingResponse → text/event-stream) plus
-#                   fire-and-forget logger emission (5 events per successful
-#                   call: request_received, upstream_call, stream_complete,
-#                   conversation_capture; or 4 on error: request_received,
-#                   upstream_call, upstream_error, [no stream_complete or
-#                   capture]).
+#                   fire-and-forget logger emission (request_received,
+#                   upstream_call, stream_complete, conversation_capture on
+#                   success; or request_received, upstream_call,
+#                   upstream_error on error). When memory is active, a
+#                   memory_retrieve_degraded ops_event may precede the
+#                   stream, and a background ingest (with possible
+#                   memory_ingest_error events) follows a successful stream.
 #   GET  /health  — proxied openagent-infra readiness
 #
 # SESSION STATE:
-#   None in-process. Stateless by design. openagent-api emits session_id
-#   and user_id as null on every event — the reference stack does not track
-#   sessions or users. These are reserved, nullable correlation fields that
-#   openagent-logger accepts as null; openagent-api does not read a session
-#   header and holds no per-session state.
+#   None in-process. Stateless across requests by design. session_id is read
+#   from the MEMORY_SESSION_ID env var (a single static value for now) and
+#   threaded onto every emitted event; it is null when memory is not
+#   configured or MEMORY_SESSION_ID is unset. user_id is always null — the
+#   reference stack has no per-user identity. openagent-api holds no
+#   per-session conversation memory itself; durable conversation memory (when
+#   enabled) lives in openagent-memory's own database, reached over HTTP.
 # ============================================================================
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Set
 
 import httpx
 from dotenv import load_dotenv
@@ -338,6 +388,7 @@ from pydantic import BaseModel, Field
 
 from client.infra import InfraClient
 from client.logger import LoggerClient
+from client.memory import MemoryClient
 
 # Load environment variables before anything else so all os.environ.get()
 # calls below see the correct values.
@@ -393,8 +444,8 @@ logger: logging.Logger = setup_logging()
 # ============================================================================
 # All configuration is environment-driven so the same image runs in dev,
 # staging, and production without code changes. Defaults match the
-# openagent-frontend, openagent-infra, and openagent-logger datasheet
-# conventions wherever they overlap.
+# openagent-frontend, openagent-infra, openagent-logger, and openagent-memory
+# datasheet conventions wherever they overlap.
 
 class Config:
     """
@@ -471,6 +522,54 @@ class Config:
                             throughput. Not forwarded to openagent-logger;
                             this is an openagent-api-side operational
                             tunable.
+
+        MEMORY_URL:         Base URL of openagent-memory. No trailing slash.
+                            OPTIONAL — memory is opt-in. When MEMORY_URL and
+                            MEMORY_API_KEY are both set, memory is enabled
+                            (MEMORY_ENABLED). When unset, openagent-api
+                            forwards the full history exactly as it did
+                            before memory existed. Typically
+                            http://openagent-memory:8004 on a shared network.
+
+        MEMORY_API_KEY:     Outbound transport secret for the
+                            openagent-memory boundary. Sent as X-API-Key on
+                            every /retrieve and /ingest call. MUST match
+                            openagent-memory's MEMORY_API_KEY byte-for-byte.
+                            OPTIONAL (required only to enable memory). Never
+                            logged, never echoed. (No HMAC on this boundary
+                            today — openagent-memory uses transport-key auth
+                            only; the MemoryClient scaffolds signing for a
+                            future addition.)
+
+        MEMORY_SESSION_ID:  Static session id used to scope memory
+                            retrieve/ingest AND to populate the logger's
+                            session_id field. A stopgap until the frontend
+                            manages conversations and supplies a per-session
+                            id. When empty, memory retrieve/ingest is inactive
+                            even if MEMORY_ENABLED (no session to scope), and
+                            session_id is emitted as null.
+
+        MEMORY_RECENT_N:    Number of most-recent conversation messages kept
+                            verbatim in the assembled prompt, ahead of the
+                            current user turn. The retrieved older turns are
+                            deduped against this window. Counted in messages
+                            (a user or assistant turn each count as one).
+                            Default 10.
+
+        MEMORY_TOP_K:       Optional cap on retrieved turns per /retrieve.
+                            When unset (None), the field is omitted from the
+                            request and openagent-memory applies its own
+                            default (MEMORY_TOP_K_DEFAULT, 5).
+
+        MEMORY_RETRIEVE_TIMEOUT: Read timeout (seconds) on the hot-path
+                            /retrieve call. Short by design — a cold embedder
+                            behind memory should fail open fast so the /chat
+                            hot path is never delayed. Passed into
+                            MemoryClient at construction.
+
+        MEMORY_ENABLED:     Derived (not an env var). True iff MEMORY_URL and
+                            MEMORY_API_KEY are both set. Gates whether the
+                            MemoryClient is constructed at startup.
     """
 
     INFRA_URL: str = os.environ.get(
@@ -519,6 +618,35 @@ class Config:
     LOGGER_QUEUE_MAX_SIZE: int = int(
         os.environ.get("OPENAGENT_LOGGER_QUEUE_MAX_SIZE", "1000")
     )
+
+    # ----- memory boundary (OPTIONAL / opt-in) -----
+
+    MEMORY_URL: str = os.environ.get(
+        "MEMORY_URL", ""
+    ).strip().rstrip("/")
+
+    MEMORY_API_KEY: str = os.environ.get("MEMORY_API_KEY", "").strip()
+
+    MEMORY_SESSION_ID: str = os.environ.get(
+        "MEMORY_SESSION_ID", ""
+    ).strip()
+
+    MEMORY_RECENT_N: int = int(os.environ.get("MEMORY_RECENT_N", "10"))
+
+    MEMORY_TOP_K: Optional[int] = (
+        None
+        if os.environ.get("MEMORY_TOP_K", "").strip() == ""
+        else int(os.environ["MEMORY_TOP_K"])
+    )
+
+    MEMORY_RETRIEVE_TIMEOUT: float = float(
+        os.environ.get("MEMORY_RETRIEVE_TIMEOUT", "5.0")
+    )
+
+    # Derived opt-in flag — memory is enabled only when both its URL and key
+    # are present. Memory is NOT a refuse-to-boot dependency; when disabled,
+    # openagent-api forwards the full history exactly as before.
+    MEMORY_ENABLED: bool = bool(MEMORY_URL) and bool(MEMORY_API_KEY)
 
 
 config = Config()
@@ -662,6 +790,125 @@ def _try_parse_sse_event(event_str: str) -> Optional[Dict[str, Any]]:
 
 
 # ============================================================================
+# PROMPT ASSEMBLY (memory-aware) — used by chat_endpoint
+# ============================================================================
+# Pure functions, module-level for the same reasons as _try_parse_sse_event:
+# testable in isolation, and keeping chat_endpoint readable while honouring
+# the single-file-app design. These are only used on the memory-enabled path;
+# the memory-disabled path keeps the original "[bio] + full history" build
+# inline in chat_endpoint.
+#
+# The memory-enabled assembly is:
+#
+#     [system: bio] + [retrieved older turns, deduped] + [recent N verbatim]
+#                   + [current user turn]
+#
+# Memory only RANKS (returns candidate turns + scores); openagent-api BUILDS
+# the final query. The retrieved block is deduped against the recent-N window
+# and the current turn by SHA-256 content hash — the same key openagent-memory
+# uses for its own storage dedupe — so a turn that is both recent and relevant
+# (or a near-verbatim repeat of the current turn) is never duplicated.
+
+def _content_hash(text: str) -> str:
+    """
+    SHA-256 hex of the UTF-8 encoded content. Matches openagent-memory's
+    dedupe key so the de-duplication here is consistent with memory's own.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _last_user_index(messages: List[Dict[str, str]]) -> Optional[int]:
+    """
+    Index of the LAST user-role message in the list, or None if there is no
+    user message. The current turn being answered is the last user message;
+    everything before it is conversation history.
+    """
+    idx: Optional[int] = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            idx = i
+    return idx
+
+
+def _assemble_messages_with_memory(
+    identity_text: str,
+    retrieved: List[Dict[str, Any]],
+    incoming_messages: List[Dict[str, str]],
+    recent_n: int,
+) -> List[Dict[str, str]]:
+    """
+    Build the upstream messages list for the memory-enabled path.
+
+    Layout:
+        [system: bio]
+        + [retrieved older turns, deduped vs recent-N and current, in
+           chronological order]
+        + [recent N verbatim turns]
+        + [current user turn]
+
+    Args:
+        identity_text:     bio.txt content, used as the system message.
+        retrieved:         Raw turn dicts from openagent-memory, each shaped
+                           {id, role, content, score, created_at}. May be
+                           empty (no results, or retrieval degraded).
+        incoming_messages: The frontend's full message list AFTER system-
+                           message filtering, ending (normally) with the
+                           current user turn.
+        recent_n:          How many of the most-recent history messages to
+                           keep verbatim ahead of the current turn.
+
+    Returns:
+        The assembled messages list ready to forward to openagent-infra.
+    """
+    last_idx = _last_user_index(incoming_messages)
+    if last_idx is None:
+        # Defensive — chat_endpoint validates that a user message exists
+        # before calling this, but never assume. Fall back to full history.
+        return [
+            {"role": "system", "content": identity_text}
+        ] + incoming_messages
+
+    current_message = incoming_messages[last_idx]
+    history = incoming_messages[:last_idx]
+    recent = history[-recent_n:] if recent_n > 0 else []
+
+    # Dedup retrieved against the recent-N window AND the current turn by
+    # content hash, so a turn that is both recent and relevant — or a
+    # near-verbatim repeat of the current turn — is not included twice.
+    exclude_hashes: Set[str] = {_content_hash(m["content"]) for m in recent}
+    exclude_hashes.add(_content_hash(current_message["content"]))
+
+    # Order retrieved chronologically (created_at ascending, unknown last) so
+    # the older-context block reads in time order before the recent verbatim
+    # turns. ISO-8601 strings sort lexically in time order, so no parsing is
+    # needed; turns with a null/missing created_at sort to the end.
+    ordered = sorted(
+        retrieved,
+        key=lambda t: (t.get("created_at") is None, t.get("created_at") or ""),
+    )
+
+    retrieved_messages: List[Dict[str, str]] = []
+    seen_hashes: Set[str] = set()
+    for turn in ordered:
+        content = turn.get("content")
+        role = turn.get("role")
+        if not content or role not in ("user", "assistant"):
+            continue
+        h = _content_hash(content)
+        if h in exclude_hashes or h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        retrieved_messages.append({"role": role, "content": content})
+
+    return (
+        [{"role": "system", "content": identity_text}]
+        + retrieved_messages
+        + recent
+        + [current_message]
+    )
+
+
+# ============================================================================
 # GLOBAL RUNTIME STATE
 # ============================================================================
 # Populated inside the lifespan context manager at startup. Module-level
@@ -671,10 +918,16 @@ def _try_parse_sse_event(event_str: str) -> Optional[Dict[str, Any]]:
 # infra_client encapsulates the httpx.AsyncClient used for the
 # openagent-infra boundary; the surface visible to this file is
 # start()/stop()/stream_chat()/check_health().
+#
+# memory_client is None unless openagent-memory is configured (opt-in). When
+# present it owns its own httpx.AsyncClient plus a set of in-flight ingest
+# tasks; the surface visible here is start()/stop()/retrieve()/
+# ingest_turn_pair_background().
 
 identity: str = ""
 infra_client: Optional[InfraClient] = None
 logger_client: Optional[LoggerClient] = None
+memory_client: Optional[MemoryClient] = None
 
 
 # ============================================================================
@@ -699,20 +952,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
          LOGGER_API_KEY, LOGGER_HMAC_SECRET).
       8. Instantiate the LoggerClient and launch its background drain task
          via client.start().
-      9. Log readiness.
+      9. If openagent-memory is configured (MEMORY_ENABLED), instantiate the
+         MemoryClient and call start(). Memory is OPT-IN and NOT a
+         refuse-to-boot dependency — when unconfigured, openagent-api
+         forwards full history exactly as before.
+     10. Log readiness.
 
-    Shutdown sequence:
-      1. Stop the LoggerClient, allowing pending events to drain (with
-         timeout) before the upstream connection pool is torn down. We want
-         emissions to finish before we tear anything else down.
-      2. Stop the InfraClient, which closes its underlying
+    Shutdown sequence (memory → logger → infra):
+      1. Stop the MemoryClient FIRST (if present), draining in-flight ingest
+         tasks. Doing this before the LoggerClient means any
+         memory_ingest_error ops_events emitted during the drain can still
+         be enqueued onto a live logger queue.
+      2. Stop the LoggerClient, allowing pending events to drain (with
+         timeout) before the upstream connection pool is torn down.
+      3. Stop the InfraClient, which closes its underlying
          httpx.AsyncClient.
-      3. Log final state.
+      4. Log final state.
 
     The lifespan context manager (FastAPI 0.93+) replaces the deprecated
     @app.on_event("startup") / @app.on_event("shutdown") pair.
     """
-    global identity, infra_client, logger_client
+    global identity, infra_client, logger_client, memory_client
 
     # ------------------------------------------------------------------
     # 1. Banner
@@ -848,7 +1108,43 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ------------------------------------------------------------------
-    # 9. Ready
+    # 9. Instantiate and start the MemoryClient (OPTIONAL / opt-in)
+    # ------------------------------------------------------------------
+    # Memory is enabled only when MEMORY_URL and MEMORY_API_KEY are both
+    # present. It is NOT a refuse-to-boot dependency: when unconfigured,
+    # openagent-api forwards the full history exactly as it did before memory
+    # existed. We do NOT probe openagent-memory at startup — retrieves fail
+    # open and ingests surface their own failures when they run.
+    if config.MEMORY_ENABLED:
+        memory_client = MemoryClient(
+            url=config.MEMORY_URL,
+            api_key=config.MEMORY_API_KEY,
+            retrieve_timeout=config.MEMORY_RETRIEVE_TIMEOUT,
+        )
+        await memory_client.start()
+        if not config.MEMORY_SESSION_ID:
+            logger.warning(
+                "MemoryClient enabled but MEMORY_SESSION_ID is unset; "
+                "retrieval and ingest will be INACTIVE until a session_id is "
+                "available (env var today; frontend-managed later). Full "
+                "history is forwarded in the meantime."
+            )
+        logger.info(
+            f"MemoryClient ready "
+            f"(url={config.MEMORY_URL}, "
+            f"recent_n={config.MEMORY_RECENT_N}, "
+            f"top_k="
+            f"{config.MEMORY_TOP_K if config.MEMORY_TOP_K is not None else 'memory-default'}, "
+            f"session_id={'set' if config.MEMORY_SESSION_ID else 'unset'})"
+        )
+    else:
+        logger.info(
+            "openagent-memory not configured (MEMORY_URL / MEMORY_API_KEY "
+            "unset); retrieval and ingest disabled, forwarding full history."
+        )
+
+    # ------------------------------------------------------------------
+    # 10. Ready
     # ------------------------------------------------------------------
     logger.info("=" * 60)
     logger.info(f"openagent-api v{API_VERSION} is ready to accept requests.")
@@ -859,13 +1155,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # ------------------------------------------------------------------
-    # SHUTDOWN
+    # SHUTDOWN (memory → logger → infra)
     # ------------------------------------------------------------------
     logger.info("openagent-api shutting down...")
 
-    # Stop the LoggerClient first so any pending events drain before the
-    # rest of the service tears down. The client's stop() waits up to its
-    # drain_timeout (default 5s) for the queue to empty, then cancels its
+    # Stop the MemoryClient FIRST so in-flight ingest tasks drain before the
+    # rest of the service tears down. Draining before the LoggerClient stops
+    # means any memory_ingest_error ops_events emitted during the drain can
+    # still be enqueued onto a live logger queue.
+    if memory_client is not None:
+        try:
+            await memory_client.stop()
+        except Exception as err:
+            logger.warning(
+                f"Error stopping MemoryClient: "
+                f"{type(err).__name__}: {err}"
+            )
+
+    # Stop the LoggerClient next so any pending events drain before the
+    # upstream connection pool is torn down. The client's stop() waits up to
+    # its drain_timeout (default 5s) for the queue to empty, then cancels its
     # background task and closes its internal httpx client.
     if logger_client is not None:
         try:
@@ -876,8 +1185,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 f"{type(err).__name__}: {err}"
             )
 
-    # Stop the InfraClient, which closes its internal httpx.AsyncClient. The
-    # client logs its own "InfraClient closed." line on successful close.
+    # Stop the InfraClient last, which closes its internal httpx.AsyncClient.
+    # The client logs its own "InfraClient closed." line on successful close.
     if infra_client is not None:
         try:
             await infra_client.stop()
@@ -900,9 +1209,11 @@ app = FastAPI(
         "The identity gateway for OpenAgent. SSE relay between "
         "openagent-frontend and openagent-infra (via InfraClient), with "
         "fire-and-forget event emission to openagent-logger (via "
-        "LoggerClient). Owns the OpenAgent system prompt and the three "
-        "outbound secrets (INFRA_API_KEY, LOGGER_API_KEY, "
-        "LOGGER_HMAC_SECRET); remains stateless across requests."
+        "LoggerClient) and optional session-scoped retrieval/ingest via "
+        "openagent-memory (via MemoryClient). Owns the OpenAgent system "
+        "prompt and the outbound secrets (INFRA_API_KEY, LOGGER_API_KEY, "
+        "LOGGER_HMAC_SECRET, and — when memory is enabled — MEMORY_API_KEY); "
+        "remains stateless across requests."
     ),
     version=API_VERSION,
     docs_url="/docs",
@@ -993,6 +1304,10 @@ class ChatRequest(BaseModel):
                   avoid two sources of truth for the same setting. Pydantic
                   validates the value if present; an invalid value produces
                   HTTP 422 automatically before any upstream call is made.
+
+    Note: there is intentionally no session_id field yet. session_id comes
+    from the MEMORY_SESSION_ID env var today; it will move to a request
+    field (or header) once the frontend manages conversations.
     """
     messages: List[Message]
     reasoning_effort: Optional[str] = Field(
@@ -1002,7 +1317,7 @@ class ChatRequest(BaseModel):
 
 
 # ============================================================================
-# CHAT ENDPOINT — SSE RELAY + LOGGER EMISSION
+# CHAT ENDPOINT — SSE RELAY + LOGGER EMISSION (+ OPTIONAL MEMORY)
 # ============================================================================
 
 @app.post("/chat", dependencies=[Depends(require_api_key)])
@@ -1020,33 +1335,39 @@ async def chat_endpoint(
          str(uuid.uuid4()) form). This is the correlation ID joining the
          ops_events and conversation_capture for THIS /chat call. Captured
          here so every emission uses the same value.
-      2. session_id is None (reserved, nullable correlation field; the
-         reference stack does not track sessions, and openagent-logger's
-         schema accepts null).
+      2. session_id is read from MEMORY_SESSION_ID (None when unset). It is
+         threaded onto every emitted event and, when present alongside a
+         configured MemoryClient (memory_active), scopes memory
+         retrieve/ingest.
       3. Capture chat_start_time via time.monotonic() for latency.
       4. Emit request_received ops_event (after auth passes, before any
          other work — including before validation).
       5. Validate the messages list (non-empty, contains a user message).
          On validation failure, raise 400/422 — no further events are
-         emitted. The request_received already captured that a request
-         arrived; the HTTP response code carries the validation outcome.
+         emitted.
       6. Drop any "system" messages the frontend tried to send.
-      7. Build the upstream payload by prepending bio.txt as the first
-         system message and conditionally including reasoning_effort if the
-         frontend sent one.
-      8. Return StreamingResponse wrapping sse_pump(). The pump:
+      7. Extract the current/last user message (the retrieve query and the
+         conversation_capture / memory-ingest input_text).
+      8. If memory is active, await retrieve() (bounded, fail-open) for this
+         session BEFORE assembling the prompt; emit memory_retrieve_degraded
+         on a degraded result.
+      9. Assemble the upstream messages list — the memory path
+         ([bio] + retrieved + recent N + current) when memory is active, or
+         the original [bio] + full history otherwise.
+     10. Build the upstream payload (+ reasoning_effort pass-through).
+     11. Return StreamingResponse wrapping sse_pump(). The pump:
          a. Emits upstream_call ops_event.
          b. Opens the streaming POST via
-            infra_client.stream_chat(upstream_payload). The
-            `async with ... as upstream:` semantics are httpx's own.
+            infra_client.stream_chat(upstream_payload).
          c. On non-200 upstream: emits upstream_error, yields error event,
-            returns (no stream_complete, no capture).
+            returns (no stream_complete, no capture, no ingest).
          d. On happy path: yields each chunk byte-for-byte AND accumulates
             delta.content tokens via side-channel parsing.
          e. On clean stream end: emits stream_complete (success) and
-            conversation_capture with assembled output_text.
+            conversation_capture, and — when memory is active — fires the
+            background user+assistant ingest.
          f. On client disconnect mid-stream: emits stream_complete
-            (client_disconnect), no capture.
+            (client_disconnect); no capture, no ingest.
          g. On any exception: emits upstream_error, yields error event.
 
     Args:
@@ -1070,14 +1391,21 @@ async def chat_endpoint(
     # 1-3. CORRELATION IDS AND TIMING
     # ------------------------------------------------------------------
     # request_id is the canonical correlation key for this /chat call,
-    # carried on every event emitted to openagent-logger. session_id is a
-    # reserved, nullable correlation field — always None, because the
-    # reference stack does not track sessions. chat_start_time anchors the
-    # latency measurement that lands in stream_complete and
+    # carried on every event emitted to openagent-logger. session_id comes
+    # from MEMORY_SESSION_ID (None when unset); it threads onto every event
+    # and scopes memory retrieve/ingest when memory is active. chat_start_time
+    # anchors the latency measurement that lands in stream_complete and
     # conversation_capture.
     request_id: str = str(uuid.uuid4())
-    session_id: Optional[str] = None
+    session_id: Optional[str] = config.MEMORY_SESSION_ID or None
     chat_start_time: float = time.monotonic()
+
+    # Memory is "active" for this request only when the client was
+    # constructed (memory configured) AND we have a session_id to scope it.
+    # Without a session_id we cannot retrieve/ingest, so we behave exactly as
+    # if memory were disabled (forward full history) rather than truncating
+    # to recent-N with no retrieval to compensate.
+    memory_active: bool = memory_client is not None and session_id is not None
 
     # ------------------------------------------------------------------
     # 4. EMIT request_received
@@ -1143,14 +1471,70 @@ async def chat_endpoint(
         )
 
     # ------------------------------------------------------------------
-    # 7. PREPEND bio.txt AS THE SYSTEM MESSAGE
+    # 7. EXTRACT THE CURRENT (LAST) USER MESSAGE
     # ------------------------------------------------------------------
-    upstream_messages: List[Dict[str, str]] = [
-        {"role": "system", "content": identity}
-    ] + incoming_messages
+    # This is the user's most recent input. It is:
+    #   - the retrieve query (memory searches PRIOR turns against it),
+    #   - the conversation_capture input_text, and
+    #   - the user-turn content for memory ingest.
+    # Snapshotted here (before sse_pump runs) so it's in scope for the
+    # eventual emission and ingest inside the pump.
+    last_user_text: str = next(
+        (
+            m["content"]
+            for m in reversed(incoming_messages)
+            if m["role"] == "user"
+        ),
+        "",
+    )
 
     # ------------------------------------------------------------------
-    # 7b. BUILD UPSTREAM PAYLOAD — PURE PASS-THROUGH OF reasoning_effort
+    # 8. MEMORY RETRIEVE (hot path, bounded, fail-open) — memory path only
+    # ------------------------------------------------------------------
+    # Awaited before prompt assembly so the retrieved older turns can be
+    # spliced into the upstream messages. retrieve() never raises: any
+    # timeout / transport error / non-200 / degraded:true returns
+    # ([], degraded=True). On a degraded result we proceed with recent turns
+    # only and emit an ops_event so operators can correlate answer-quality
+    # dips with embedder cold-starts.
+    retrieved_turns: List[Dict[str, Any]] = []
+    if memory_active and memory_client is not None:
+        retrieved_turns, mem_degraded = await memory_client.retrieve(
+            session_id=session_id,
+            query=last_user_text,
+            top_k=config.MEMORY_TOP_K,
+        )
+        if mem_degraded:
+            retrieved_turns = []
+            logger_client.emit_ops_event(
+                action="memory_retrieve_degraded",
+                outcome="degraded",
+                request_id=request_id,
+                session_id=session_id,
+                details={"reason": "memory_unavailable_or_embedder_cold"},
+            )
+
+    # ------------------------------------------------------------------
+    # 9. ASSEMBLE UPSTREAM MESSAGES
+    # ------------------------------------------------------------------
+    # Memory path: [bio] + [retrieved older, deduped] + [recent N] + [current].
+    # Disabled path: [bio] + full history (the original behaviour). We only
+    # truncate to recent-N when memory is active, because truncating without
+    # retrieval to compensate would drop context for nothing.
+    if memory_active:
+        upstream_messages: List[Dict[str, str]] = _assemble_messages_with_memory(
+            identity_text=identity,
+            retrieved=retrieved_turns,
+            incoming_messages=incoming_messages,
+            recent_n=config.MEMORY_RECENT_N,
+        )
+    else:
+        upstream_messages = [
+            {"role": "system", "content": identity}
+        ] + incoming_messages
+
+    # ------------------------------------------------------------------
+    # 10. BUILD UPSTREAM PAYLOAD — PURE PASS-THROUGH OF reasoning_effort
     # ------------------------------------------------------------------
     # If the frontend sent reasoning_effort, include it in the upstream
     # payload. If not, omit the field entirely so openagent-infra applies
@@ -1160,21 +1544,6 @@ async def chat_endpoint(
     upstream_payload: Dict[str, Any] = {"messages": upstream_messages}
     if request.reasoning_effort is not None:
         upstream_payload["reasoning_effort"] = request.reasoning_effort
-
-    # ------------------------------------------------------------------
-    # 7c. EXTRACT LAST USER MESSAGE FOR conversation_capture
-    # ------------------------------------------------------------------
-    # The conversation_capture's input_text is the user's most recent input.
-    # We snapshot it here (before sse_pump runs) so it's in scope for the
-    # eventual emission inside the pump.
-    last_user_text: str = next(
-        (
-            m["content"]
-            for m in reversed(incoming_messages)
-            if m["role"] == "user"
-        ),
-        "",
-    )
 
     # Brief structured log line — full message bodies are not logged because
     # they can contain user data. Logging is intentionally minimal here;
@@ -1192,17 +1561,25 @@ async def chat_endpoint(
         if request.reasoning_effort is not None
         else "unset"
     )
+    memory_log = ""
+    if memory_active:
+        memory_log = (
+            f"retrieved={len(retrieved_turns)} "
+            f"assembled_turns={len(upstream_messages)} "
+        )
     logger.info(
         f"POST /chat | req={request_id} "
         f"turns={len(incoming_messages)} "
         f"user_msgs={user_msg_count} "
         f"reasoning_effort={effort_label} "
+        f"session={'set' if session_id else 'none'} "
+        f"{memory_log}"
         f"| last_user: {last_user_preview}"
         f"{'...' if len(last_user_preview) >= 60 else ''}"
     )
 
     # ------------------------------------------------------------------
-    # 8. GUARD: ensure infra_client was initialised
+    # 11. GUARD: ensure infra_client was initialised
     # ------------------------------------------------------------------
     # If lifespan startup did not run (which would only happen if something
     # is very wrong), fail clearly rather than NoneType-error.
@@ -1213,13 +1590,14 @@ async def chat_endpoint(
         )
 
     # ------------------------------------------------------------------
-    # 9. OPEN UPSTREAM STREAM AND PUMP BYTES (+ accumulate for capture)
+    # 12. OPEN UPSTREAM STREAM AND PUMP BYTES (+ accumulate for capture)
     # ------------------------------------------------------------------
     async def sse_pump() -> AsyncIterator[bytes]:
         """
         Async generator that pipes openagent-infra's SSE stream to the
         frontend byte-for-byte AND maintains a side-channel content
-        accumulator for the eventual conversation_capture.
+        accumulator for the eventual conversation_capture (and, when memory
+        is active, the assistant-turn ingest).
 
         Relay behaviour: yields raw bytes — including the data: prefix and
         the \\n\\n separators — exactly as openagent-infra emits them. Each
@@ -1255,6 +1633,11 @@ async def chat_endpoint(
           - stream_complete  : after the stream finishes (success or
                                client_disconnect)
           - conversation_capture : after a successful stream_complete only
+
+        Memory (when active): after a successful stream_complete and the
+        conversation_capture, ingest_turn_pair_background() is fired to store
+        the user turn then the assistant turn off the user's path. A
+        client-disconnect or upstream-error turn ingests neither side.
 
         If the client disconnects mid-stream we exit the loop early so the
         upstream connection can be closed and openagent-infra stops wasting
@@ -1336,8 +1719,8 @@ async def chat_endpoint(
                         "data: [DONE]\n\n"
                     ).encode("utf-8")
                     yield error_event
-                    # No stream_complete, no conversation_capture — the
-                    # stream never actually happened.
+                    # No stream_complete, no conversation_capture, no memory
+                    # ingest — the stream never actually happened.
                     return
 
                 # ----------------------------------------------------------
@@ -1352,9 +1735,9 @@ async def chat_endpoint(
                         )
                         # Emit stream_complete with outcome=client_disconnect
                         # so we have visibility into how often this happens.
-                        # No conversation_capture — the conversation is
-                        # incomplete from the user's perspective and isn't
-                        # useful to capture.
+                        # No conversation_capture and no memory ingest — the
+                        # conversation is incomplete from the user's
+                        # perspective and isn't useful to capture or store.
                         disconnect_latency_ms = int(
                             (time.monotonic() - chat_start_time) * 1000
                         )
@@ -1410,7 +1793,8 @@ async def chat_endpoint(
 
                 # ----------------------------------------------------------
                 # Stream finished cleanly. Emit stream_complete and the
-                # conversation_capture.
+                # conversation_capture, then (when memory is active) fire the
+                # background user+assistant ingest.
                 # ----------------------------------------------------------
                 latency_ms = int(
                     (time.monotonic() - chat_start_time) * 1000
@@ -1446,6 +1830,35 @@ async def chat_endpoint(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                 )
+
+                # ------------------------------------------------------
+                # MEMORY INGEST (off the user's path) — success branch only.
+                # ------------------------------------------------------
+                # Fire-and-forget a tracked background task that ingests the
+                # user turn then the assistant turn (sequential, so created_at
+                # reflects turn order). This is synchronous and non-blocking —
+                # it schedules the task and returns immediately, so the
+                # StreamingResponse generator finishes promptly while the
+                # ingests complete on their own (a cold embedder cannot hold
+                # the connection open after the user already has their
+                # answer). Failures are caught inside the task: logged, and
+                # surfaced to the logger as memory_ingest_error via the
+                # on_event callback below. They never affect /chat.
+                if memory_active and memory_client is not None:
+                    memory_client.ingest_turn_pair_background(
+                        session_id=session_id,
+                        user_text=last_user_text,
+                        assistant_text=output_text,
+                        on_event=lambda action, outcome, details: (
+                            logger_client.emit_ops_event(
+                                action=action,
+                                outcome=outcome,
+                                request_id=request_id,
+                                session_id=session_id,
+                                details=details,
+                            )
+                        ),
+                    )
 
         except httpx.ConnectTimeout:
             logger.error(
@@ -1539,7 +1952,7 @@ async def chat_endpoint(
             ).encode("utf-8")
 
     # ------------------------------------------------------------------
-    # 10. RETURN STREAMINGRESPONSE
+    # 13. RETURN STREAMINGRESPONSE
     # ------------------------------------------------------------------
     # Headers chosen so any reverse proxy in front of openagent-api (nginx,
     # traefik, Cloudflare) does not buffer the stream:
@@ -1625,6 +2038,13 @@ async def health_check() -> JSONResponse:
     events per hour with no operational value. If operational visibility
     into /health behaviour becomes needed later, a dedicated "health_check"
     ops_event can be added with an intentional sampling policy.
+
+    Note on openagent-memory and openagent-logger: /health intentionally does
+    NOT include either's status. Both are non-essential to serving a /chat
+    response — the logger is fire-and-forget, and memory retrieval fails open
+    to "recent turns only". Coupling the gate-open signal to either would
+    make a degraded but non-fatal dependency look like a hard outage to the
+    frontend. To check those directly, query their own /health endpoints.
     """
     upstream_status: str = "unreachable"
     upstream_raw: Optional[Dict[str, Any]] = None

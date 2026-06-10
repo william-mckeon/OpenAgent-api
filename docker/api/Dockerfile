@@ -9,16 +9,18 @@
 #   pure-Python container with FastAPI + uvicorn + httpx and the persona
 #   (bio.txt) baked in. No GPU, no CUDA, no compilers — this service does no
 #   inference work. All it does is auth, identity injection, SSE relay between
-#   openagent-frontend and openagent-infra, and fire-and-forget event emission
-#   to openagent-logger.
+#   openagent-frontend and openagent-infra, fire-and-forget event emission
+#   to openagent-logger, and — when openagent-memory is configured — optional
+#   session-scoped retrieval/ingest against openagent-memory.
 #
 # IMAGE SIZE TARGET:
 #   ~150-200 MB total. Pure-Python, slim base. Comparable to the
 #   openagent-frontend image and to openagent-infra (which is also a thin
-#   FastAPI proxy). The logger and infra clients add zero MB to the image:
-#   they use Python stdlib (hmac, hashlib, json, logging) for signing and
-#   diagnostics and reuse the already-installed httpx for HTTP, so no new
-#   pip packages, no new apt packages, and no new compilers are needed.
+#   FastAPI proxy). The logger, infra, and memory clients add zero MB to the
+#   image: they use Python stdlib (hmac, hashlib, json, asyncio, logging) for
+#   signing, scheduling, and diagnostics and reuse the already-installed httpx
+#   for HTTP, so no new pip packages, no new apt packages, and no new
+#   compilers are needed.
 #
 # BASE IMAGE CHOICE:
 #   python:3.11-slim — same Python major.minor as openagent-frontend so the
@@ -47,8 +49,8 @@
 #     6. application source copy   — changes on every code edit
 #   This means a typical code-only change to api.py rebuilds in seconds
 #   because layers 1-5 are pulled from the cache. Editing a client module
-#   (client/logger.py or client/infra.py) invalidates layers 5-6 only.
-#   Editing bio.txt invalidates 4-6.
+#   (client/logger.py, client/infra.py, or client/memory.py) invalidates
+#   layers 5-6 only. Editing bio.txt invalidates 4-6.
 #
 # REBUILD TRIGGERS:
 #   Changing src/backend/api.py    → fast rebuild (last COPY layer only)
@@ -73,15 +75,18 @@
 #   api.py's lifespan startup; if any is missing the container refuses to
 #   boot and HEALTHCHECK is never reached. If HEALTHCHECK reports healthy,
 #   all six runtime secrets/URLs the gateway needs are by definition present
-#   and valid. The /health endpoint's upstream probe is handled by
-#   InfraClient.check_health(); the endpoint contract — auth requirement,
-#   response shape, status vocabulary — is independent of that internal call.
+#   and valid. (The openagent-memory env vars are optional and opt-in — they
+#   are NOT part of this boot gate; when unset, the gateway forwards full
+#   history exactly as before.) The /health endpoint's upstream probe is
+#   handled by InfraClient.check_health(); the endpoint contract — auth
+#   requirement, response shape, status vocabulary — is independent of that
+#   internal call.
 #
 # PORT:
 #   Container listens on 8001 (per the port convention in api.py's
 #   architecture diagram: 8000=frontend, 8001=openagent-api,
-#   8002=openagent-infra, 8003=openagent-logger). docker-compose.yml maps
-#   host 8001 → container 8001.
+#   8002=openagent-infra, 8003=openagent-logger, 8004=openagent-memory).
+#   docker-compose.yml maps host 8001 → container 8001.
 #
 # RUNTIME ENV VARS EXPECTED FROM docker-compose.yml / .env:
 #   OPENAGENT_API_KEY    — inbound auth (validated by /chat and /health,
@@ -96,6 +101,14 @@
 #   OPENAGENT_UPSTREAM_CONNECT_TIMEOUT, OPENAGENT_UPSTREAM_READ_TIMEOUT,
 #   OPENAGENT_HEALTH_TIMEOUT, OPENAGENT_BIO_PATH,
 #   OPENAGENT_LOGGER_QUEUE_MAX_SIZE).
+#   Plus optional openagent-memory vars (memory is opt-in — unset by
+#   default, and NOT required to boot):
+#     MEMORY_URL              — openagent-memory base URL
+#     MEMORY_API_KEY          — outbound to openagent-memory
+#   MEMORY_URL + MEMORY_API_KEY together enable the optional memory boundary.
+#   The rest tune it: MEMORY_SESSION_ID (scopes retrieve/ingest and populates
+#   the logger's session_id), MEMORY_RECENT_N, MEMORY_TOP_K,
+#   MEMORY_RETRIEVE_TIMEOUT.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -126,9 +139,9 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 #                              `docker logs` immediately, matching the
 #                              behaviour the other two services rely on.
 # PYTHONPATH=/app/src         Lets imports resolve as `from backend.api ...`,
-#                              `from client.logger ...`, and
-#                              `from client.infra ...` per the import path
-#                              rule in api.py's header.
+#                              `from client.logger ...`, `from client.infra
+#                              ...`, and `from client.memory ...` per the
+#                              import path rule in api.py's header.
 # PIP_NO_CACHE_DIR=1          pip doesn't cache wheels — keeps the image
 #                              small. We won't reinstall in this container.
 # PIP_DISABLE_PIP_VERSION_CHECK=1  Suppresses the pip self-update warning
@@ -151,10 +164,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #
 # `--no-install-recommends` keeps the install minimal. The apt cache is
 # cleared in the same RUN layer to avoid bloating the image. No additional
-# apt packages are needed: the logger and infra clients sign and call out
-# using Python stdlib (hmac, hashlib, json, logging) and the already-present
-# httpx — no cryptography wheel, no compilers, no OpenSSL beyond what
-# python:3.11-slim already provides for httpx's TLS.
+# apt packages are needed: the logger, infra, and memory clients sign,
+# schedule, and call out using Python stdlib (hmac, hashlib, json, asyncio,
+# logging) and the already-present httpx — no cryptography wheel, no
+# compilers, no OpenSSL beyond what python:3.11-slim already provides for
+# httpx's TLS.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && apt-get clean \
@@ -185,9 +199,9 @@ RUN groupadd --system --gid 1000 openagent \
 # ----------------------------------------------------------------------------
 # Copy requirements.txt FIRST and install in its own layer so changes to
 # application source don't invalidate the pip-install cache. This is the
-# single biggest reason rebuilds are fast. The logger and infra clients
-# reuse the existing httpx dependency; HMAC signing uses Python stdlib
-# (hmac, hashlib, json) which ships with python:3.11-slim.
+# single biggest reason rebuilds are fast. The logger, infra, and memory
+# clients reuse the existing httpx dependency; HMAC signing uses Python
+# stdlib (hmac, hashlib, json) which ships with python:3.11-slim.
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip \
     && pip install -r /app/requirements.txt
@@ -209,12 +223,15 @@ COPY src/prompt/ /app/src/prompt/
 # OUTBOUND HTTP CLIENTS
 # ----------------------------------------------------------------------------
 # src/client/ holds the modules openagent-api uses to talk to upstream
-# services. Two clients live here:
+# services. Three clients live here:
 #   client/logger.py  — fire-and-forget event emission to openagent-logger
 #   client/infra.py   — openagent-infra streaming relay + health proxy
+#   client/memory.py  — openagent-memory retrieval + ingest (optional)
 # The single `COPY src/client/ /app/src/client/` directive below picks up
-# both files because it copies the entire directory; further clients added
-# to the directory are picked up automatically, with no Dockerfile change.
+# all three files because it copies the entire directory; further clients
+# added to the directory are picked up automatically, with no Dockerfile
+# change. (client/memory.py is itself an instance of that: it was added with
+# no edit to this directive.)
 #
 # Placed BEFORE the src/backend/ COPY because client modules change less
 # frequently than the FastAPI app. A typical edit to api.py invalidates only
@@ -285,7 +302,9 @@ EXPOSE 8001
 # lifespan startup — if any is missing, the container refuses to boot and
 # this HEALTHCHECK is never reached. Therefore a passing HEALTHCHECK implies
 # all six runtime secrets/URLs are present and the container has successfully
-# wired up both the LoggerClient and the InfraClient.
+# wired up both the LoggerClient and the InfraClient. (The MemoryClient is
+# optional — it is wired up only when MEMORY_URL + MEMORY_API_KEY are set,
+# and its absence does not affect the boot gate or this healthcheck.)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl --silent --fail \
         --header "X-API-Key: ${OPENAGENT_API_KEY}" \
@@ -297,10 +316,14 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # ----------------------------------------------------------------------------
 # Run uvicorn directly (not via shell) so signals reach the Python process
 # unchanged. SIGTERM from `docker stop` triggers FastAPI's lifespan shutdown
-# handler in api.py, which:
+# handler in api.py, which stops the clients in order (memory → logger →
+# infra):
+#   - Stops the MemoryClient first when memory is configured (draining
+#     in-flight ingest tasks) so any ingest-failure events can still reach a
+#     live logger during the drain
 #   - Stops the LoggerClient (draining its queue with timeout)
 #   - Stops the InfraClient (closing its internal httpx.AsyncClient cleanly)
-# Both stops happen during the lifespan shutdown sequence so any pending
+# These stops happen during the lifespan shutdown sequence so any pending
 # logger events get a final drain attempt and the openagent-infra connection
 # pool is released before the process exits.
 #
